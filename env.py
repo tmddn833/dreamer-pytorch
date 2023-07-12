@@ -207,6 +207,9 @@ def Env(env, symbolic, seed, max_episode_length, action_repeat, bit_depth):
         return GymEnv(env, symbolic, seed, max_episode_length, action_repeat, bit_depth)
     elif env in CONTROL_SUITE_ENVS:
         return ControlSuiteEnv(env, symbolic, seed, max_episode_length, action_repeat, bit_depth)
+    elif env == "ToyGridEnv":
+        from ToyGridEnv import ToyGridEnv
+        return ToyGridEnv(seed, max_episode_length, action_repeat)
 
 
 # Wrapper for batching environments together

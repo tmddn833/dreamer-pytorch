@@ -17,6 +17,8 @@ from models import ActorModel, Encoder, ObservationModel, RewardModel, Transitio
 from planner import MPCPlanner
 from utils import FreezeParameters, imagine_ahead, lambda_return, lineplot, write_video
 
+from collections import deque
+
 # Hyperparameters
 parser = argparse.ArgumentParser(description='PlaNet or Dreamer')
 parser.add_argument('--algo', type=str, default='dreamer', help='planet or dreamer')
@@ -27,11 +29,12 @@ parser.add_argument(
     '--env',
     type=str,
     default='Pendulum-v0',
-    choices=GYM_ENVS + CONTROL_SUITE_ENVS,
+    choices=GYM_ENVS + CONTROL_SUITE_ENVS + ["ToyGridEnv"],
     help='Gym/Control Suite environment',
 )
+
 parser.add_argument('--symbolic-env', action='store_true', help='Symbolic features')
-parser.add_argument('--max-episode-length', type=int, default=1000, metavar='T', help='Max episode length')
+parser.add_argument('--max-episode-length', type=int, default=200, metavar='T', help='Max episode length')
 parser.add_argument(
     '--experience-size', type=int, default=1000000, metavar='D', help='Experience replay size'
 )  # Original implementation has an unlimited buffer size, but 1 million is the max experience collected anyway
@@ -118,6 +121,9 @@ parser.add_argument('--checkpoint-experience', action='store_true', help='Checkp
 parser.add_argument('--models', type=str, default='', metavar='M', help='Load model checkpoint')
 parser.add_argument('--experience-replay', type=str, default='', metavar='ER', help='Load experience replay')
 parser.add_argument('--render', action='store_true', help='Render environment')
+
+parser.add_argument('--random-obs-num', action='store_true', help='Random obstacle number')
+
 args = parser.parse_args()
 args.overshooting_distance = min(
     args.chunk_size, args.overshooting_distance
@@ -125,7 +131,6 @@ args.overshooting_distance = min(
 print(' ' * 26 + 'Options')
 for k, v in vars(args).items():
     print(' ' * 26 + k + ': ' + str(v))
-
 
 # Setup
 results_dir = os.path.join('results', '{}_{}'.format(args.env, args.id))
@@ -153,7 +158,10 @@ metrics = {
 }
 
 summary_name = results_dir + "/{}_{}_log"
-writer = SummaryWriter(summary_name.format(args.env, args.id))
+from datetime import datetime
+
+current_time = datetime.now().strftime('%b%d_%H-%M-%S')
+writer = SummaryWriter(summary_name.format(args.env, args.id) + current_time, flush_secs=10)
 print("writer is ready")
 
 # Initialise training environment and experience replay memory
@@ -178,7 +186,6 @@ elif not args.test:
         metrics['steps'].append(t * args.action_repeat + (0 if len(metrics['steps']) == 0 else metrics['steps'][-1]))
         metrics['episodes'].append(s)
 print("experience replay buffer is ready")
-
 
 # Initialise model parameters randomly
 transition_model = TransitionModel(
@@ -210,10 +217,10 @@ value_model = ValueModel(args.belief_size, args.state_size, args.hidden_size, ar
     device=args.device
 )
 param_list = (
-    list(transition_model.parameters())
-    + list(observation_model.parameters())
-    + list(reward_model.parameters())
-    + list(encoder.parameters())
+        list(transition_model.parameters())
+        + list(observation_model.parameters())
+        + list(reward_model.parameters())
+        + list(encoder.parameters())
 )
 value_actor_param_list = list(value_model.parameters()) + list(actor_model.parameters())
 params_list = param_list + value_actor_param_list
@@ -264,7 +271,7 @@ print("models and planners are ready")
 
 
 def update_belief_and_act(
-    args, env, planner, transition_model, encoder, belief, posterior_state, action, observation, explore=False
+        args, env, planner, transition_model, encoder, belief, posterior_state, action, observation, explore=False
 ):
     # Infer belief over current state q(s_t|o≤t,a<t) from the history
     # print("action size: ",action.size()) torch.Size([1, 6])
@@ -297,8 +304,12 @@ if args.test:
     encoder.eval()
     with torch.no_grad():
         total_reward = 0
-        for _ in tqdm(range(args.test_episodes)):
+        success_count = 0
+        for i in tqdm(range(args.test_episodes)):
+            path = []
+            env.seed(i)
             observation = env.reset()
+            path.append(observation[:, :2])
             belief, posterior_state, action = (
                 torch.zeros(1, args.belief_size, device=args.device),
                 torch.zeros(1, args.state_size, device=args.device),
@@ -318,19 +329,25 @@ if args.test:
                     observation.to(device=args.device),
                 )
                 total_reward += reward
+                path.append(observation[:, :2])
                 if args.render:
                     env.render()
                 if done:
                     pbar.close()
                     break
-    print('Average Reward:', total_reward / args.test_episodes)
+            if args.env == "ToyGridEnv" and i % (args.test_episodes // 4):
+                path = np.array(torch.stack(path)[:, 0, :])
+                fig_i = env.render_path([path])
+                writer.add_figure("test_env/test_env_{}".format(i), fig_i)
+                if t != args.max_episode_length // args.action_repeat - 1:
+                    success_count += 1
+    print('Average Reward:', total_reward / args.test_episodes, 'Success Rate:', success_count / args.test_episodes)
     env.close()
     quit()
 
-
 # Training (and testing)
 for episode in tqdm(
-    range(metrics['episodes'][-1] + 1, args.episodes + 1), total=args.episodes, initial=metrics['episodes'][-1] + 1
+        range(metrics['episodes'][-1] + 1, args.episodes + 1), total=args.episodes, initial=metrics['episodes'][-1] + 1
 ):
     # Model fitting
     losses = []
@@ -410,8 +427,8 @@ for episode in tqdm(
                         F.pad(rewards[t:d], seq_pad[2:]),
                         beliefs[t_],
                         prior_states[t_],
-                        F.pad(posterior_means[t_ + 1 : d_ + 1].detach(), seq_pad),
-                        F.pad(posterior_std_devs[t_ + 1 : d_ + 1].detach(), seq_pad, value=1),
+                        F.pad(posterior_means[t_ + 1: d_ + 1].detach(), seq_pad),
+                        F.pad(posterior_std_devs[t_ + 1: d_ + 1].detach(), seq_pad, value=1),
                         F.pad(torch.ones(d - t, args.batch_size, args.state_size, device=args.device), seq_pad),
                     )
                 )  # Posterior standard deviations must be padded with > 0 to prevent infinite KL divergences
@@ -427,31 +444,31 @@ for episode in tqdm(
             seq_mask = torch.cat(overshooting_vars[7], dim=1)
             # Calculate overshooting KL loss with sequence mask
             kl_loss += (
-                (1 / args.overshooting_distance)
-                * args.overshooting_kl_beta
-                * torch.max(
-                    (
+                    (1 / args.overshooting_distance)
+                    * args.overshooting_kl_beta
+                    * torch.max(
+                (
                         kl_divergence(
                             Normal(torch.cat(overshooting_vars[5], dim=1), torch.cat(overshooting_vars[6], dim=1)),
                             Normal(prior_means, prior_std_devs),
                         )
                         * seq_mask
-                    ).sum(dim=2),
-                    free_nats,
-                ).mean(dim=(0, 1))
-                * (args.chunk_size - 1)
+                ).sum(dim=2),
+                free_nats,
+            ).mean(dim=(0, 1))
+                    * (args.chunk_size - 1)
             )  # Update KL loss (compensating for extra average over each overshooting/open loop sequence)
             # Calculate overshooting reward prediction loss with sequence mask
             if args.overshooting_reward_scale != 0:
                 reward_loss += (
-                    (1 / args.overshooting_distance)
-                    * args.overshooting_reward_scale
-                    * F.mse_loss(
-                        bottle(reward_model, (beliefs, prior_states)) * seq_mask[:, :, 0],
-                        torch.cat(overshooting_vars[2], dim=1),
-                        reduction='none',
-                    ).mean(dim=(0, 1))
-                    * (args.chunk_size - 1)
+                        (1 / args.overshooting_distance)
+                        * args.overshooting_reward_scale
+                        * F.mse_loss(
+                    bottle(reward_model, (beliefs, prior_states)) * seq_mask[:, :, 0],
+                    torch.cat(overshooting_vars[2], dim=1),
+                    reduction='none',
+                ).mean(dim=(0, 1))
+                        * (args.chunk_size - 1)
                 )  # Update reward loss (compensating for extra average over each overshooting/open loop sequence)
         # Apply linearly ramping learning rate schedule
         if args.learning_rate_schedule != 0:
@@ -516,63 +533,72 @@ for episode in tqdm(
     metrics['actor_loss'].append(losses[3])
     metrics['value_loss'].append(losses[4])
     lineplot(
-        metrics['episodes'][-len(metrics['observation_loss']) :],
+        metrics['episodes'][-len(metrics['observation_loss']):],
         metrics['observation_loss'],
         'observation_loss',
         results_dir,
     )
-    lineplot(metrics['episodes'][-len(metrics['reward_loss']) :], metrics['reward_loss'], 'reward_loss', results_dir)
-    lineplot(metrics['episodes'][-len(metrics['kl_loss']) :], metrics['kl_loss'], 'kl_loss', results_dir)
-    lineplot(metrics['episodes'][-len(metrics['actor_loss']) :], metrics['actor_loss'], 'actor_loss', results_dir)
-    lineplot(metrics['episodes'][-len(metrics['value_loss']) :], metrics['value_loss'], 'value_loss', results_dir)
+    lineplot(metrics['episodes'][-len(metrics['reward_loss']):], metrics['reward_loss'], 'reward_loss', results_dir)
+    lineplot(metrics['episodes'][-len(metrics['kl_loss']):], metrics['kl_loss'], 'kl_loss', results_dir)
+    lineplot(metrics['episodes'][-len(metrics['actor_loss']):], metrics['actor_loss'], 'actor_loss', results_dir)
+    lineplot(metrics['episodes'][-len(metrics['value_loss']):], metrics['value_loss'], 'value_loss', results_dir)
 
     # Data collection
     print("Data collection")
-    with torch.no_grad():
-        observation, total_reward = env.reset(), 0
-        belief, posterior_state, action = (
-            torch.zeros(1, args.belief_size, device=args.device),
-            torch.zeros(1, args.state_size, device=args.device),
-            torch.zeros(1, env.action_size, device=args.device),
-        )
-        pbar = tqdm(range(args.max_episode_length // args.action_repeat))
-        for t in pbar:
-            # print("step",t)
-            belief, posterior_state, action, next_observation, reward, done = update_belief_and_act(
-                args,
-                env,
-                planner,
-                transition_model,
-                encoder,
-                belief,
-                posterior_state,
-                action,
-                observation.to(device=args.device),
-                explore=True,
-            )
-            D.append(observation, action.cpu(), reward, done)
-            total_reward += reward
-            observation = next_observation
-            if args.render:
-                env.render()
-            if done:
-                pbar.close()
-                break
+    new_samples = 0
+    t_ = 0
+    while True:
+        with torch.no_grad():
+            if args.env == "ToyGridEnv" and args.random_obs_num:
+                env.set_obstacle_num(np.random.randint(10, 100))
 
-        # Update and plot train reward metrics
-        metrics['steps'].append(t + metrics['steps'][-1])
-        metrics['episodes'].append(episode)
-        metrics['train_rewards'].append(total_reward)
-        lineplot(
-            metrics['episodes'][-len(metrics['train_rewards']) :],
-            metrics['train_rewards'],
-            'train_rewards',
-            results_dir,
-        )
+            observation, total_reward = env.reset(), 0
+            belief, posterior_state, action = (
+                torch.zeros(1, args.belief_size, device=args.device),
+                torch.zeros(1, args.state_size, device=args.device),
+                torch.zeros(1, env.action_size, device=args.device),
+            )
+            pbar = tqdm(range(args.max_episode_length // args.action_repeat))
+            for t in pbar:
+                belief, posterior_state, action, next_observation, reward, done = update_belief_and_act(
+                    args,
+                    env,
+                    planner,
+                    transition_model,
+                    encoder,
+                    belief,
+                    posterior_state,
+                    action,
+                    observation.to(device=args.device),
+                    explore=True,
+                )
+                D.append(observation, action.cpu(), reward, done)
+                new_samples += 1
+                total_reward += reward
+                observation = next_observation
+                if args.render:
+                    env.render()
+                if done:
+                    pbar.close()
+                    break
+        t_ += t
+        if new_samples >= 1000:
+            break
+
+    # Update and plot train reward metrics
+    metrics['steps'].append(t_ + metrics['steps'][-1])
+    metrics['episodes'].append(episode)
+    metrics['train_rewards'].append(total_reward)
+    lineplot(
+        metrics['episodes'][-len(metrics['train_rewards']):],
+        metrics['train_rewards'],
+        'train_rewards',
+        results_dir,
+    )
 
     # Test model
-    print("Test model")
     if episode % args.test_interval == 0:
+        print("Test model")
         # Set models to eval mode
         transition_model.eval()
         observation_model.eval()
@@ -589,12 +615,15 @@ for episode in tqdm(
         )
 
         with torch.no_grad():
-            observation, total_rewards, video_frames = test_envs.reset(), np.zeros((args.test_episodes,)), []
+            observation, total_rewards, video_frames, paths = test_envs.reset(), np.zeros((args.test_episodes,)), [], []
             belief, posterior_state, action = (
                 torch.zeros(args.test_episodes, args.belief_size, device=args.device),
                 torch.zeros(args.test_episodes, args.state_size, device=args.device),
                 torch.zeros(args.test_episodes, env.action_size, device=args.device),
             )
+
+            temp_action = []
+
             pbar = tqdm(range(args.max_episode_length // args.action_repeat))
             for t in pbar:
                 belief, posterior_state, action, next_observation, reward, done = update_belief_and_act(
@@ -608,6 +637,7 @@ for episode in tqdm(
                     action,
                     observation.to(device=args.device),
                 )
+                temp_action.append(action)
                 total_rewards += reward.numpy()
                 if not args.symbolic_env:  # Collect real vs. predicted frames for video
                     video_frames.append(
@@ -616,6 +646,8 @@ for episode in tqdm(
                             nrow=5,
                         ).numpy()
                     )  # Decentre
+                elif args.env == "ToyGridEnv":
+                    paths.append(observation[:, :2])
                 observation = next_observation
                 if done.sum().item() == args.test_episodes:
                     pbar.close()
@@ -638,6 +670,14 @@ for episode in tqdm(
             save_image(
                 torch.as_tensor(video_frames[-1]), os.path.join(results_dir, 'test_episode_%s.png' % episode_str)
             )
+        elif args.env == "ToyGridEnv":
+            for i, env in enumerate(test_envs.envs):
+                path_i = np.array(torch.stack(paths)[:, i, :])
+                last_step_idx = np.where(path_i == 0.0)[0][0] if len(np.where(path_i == 0.0)[0]) > 0 else len(path_i)
+                path_i = path_i[:last_step_idx]
+                fig_i = env.render_path([path_i])
+                writer.add_figure("test_env/test_env_{}".format(i), fig_i, episode)
+
         torch.save(metrics, os.path.join(results_dir, 'metrics.pth'))
 
         # Set models to train mode
@@ -652,11 +692,11 @@ for episode in tqdm(
 
     writer.add_scalar("train_reward", metrics['train_rewards'][-1], metrics['steps'][-1])
     writer.add_scalar("train/episode_reward", metrics['train_rewards'][-1], metrics['steps'][-1] * args.action_repeat)
-    writer.add_scalar("observation_loss", metrics['observation_loss'][0][-1], metrics['steps'][-1])
-    writer.add_scalar("reward_loss", metrics['reward_loss'][0][-1], metrics['steps'][-1])
-    writer.add_scalar("kl_loss", metrics['kl_loss'][0][-1], metrics['steps'][-1])
-    writer.add_scalar("actor_loss", metrics['actor_loss'][0][-1], metrics['steps'][-1])
-    writer.add_scalar("value_loss", metrics['value_loss'][0][-1], metrics['steps'][-1])
+    writer.add_scalar("observation_loss", metrics['observation_loss'][-1][-1], metrics['steps'][-1])
+    writer.add_scalar("reward_loss", metrics['reward_loss'][-1][-1], metrics['steps'][-1])
+    writer.add_scalar("kl_loss", metrics['kl_loss'][-1][-1], metrics['steps'][-1])
+    writer.add_scalar("actor_loss", metrics['actor_loss'][-1][-1], metrics['steps'][-1])
+    writer.add_scalar("value_loss", metrics['value_loss'][-1][-1], metrics['steps'][-1])
     print(
         "episodes: {}, total_steps: {}, train_reward: {} ".format(
             metrics['episodes'][-1], metrics['steps'][-1], metrics['train_rewards'][-1]
@@ -683,7 +723,6 @@ for episode in tqdm(
             torch.save(
                 D, os.path.join(results_dir, 'experience.pth')
             )  # Warning: will fail with MemoryError with large memory sizes
-
 
 # Close training environment
 env.close()
